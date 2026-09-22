@@ -1,0 +1,52 @@
+{
+    "device_metadata": {
+        "vendor": "Industrial Dynamics / Rotary Turbine Division",
+        "frame_bit_length": 200,
+        "nominal_frequency_hz": 14,
+        "notes": "WARNING: Customer specification is incomplete. Bit layout contains undocumented fields and noisy channels."
+    },
+    "fields": [
+        {
+            "name": "preamble_sync",
+            "bit_offset": 0,
+            "bit_length": 16,
+            "data_type": "hex",
+            "expected_constant": "0xAA55",
+            "notes": "Used to align frame boundaries."
+        },
+        {
+            "name": "timestamp_seconds",
+            "bit_offset": 24,
+            "bit_length": 32,
+            "data_type": "uint",
+            "notes": "Epoch time in seconds (UTC)."
+        },
+        {
+            "name": "motor_rpm",
+            "bit_offset": 66,
+            "bit_length": 12,
+            "data_type": "uint",
+            "scale_multiplier": 2.9304,
+            "offset_bias": 0.0,
+            "unit": "RPM",
+            "notes": "Calibrated multiplier approximates: (raw / 4095) * 12000."
+        },
+        {
+            "name": "cylinder_temperature_raw",
+            "bit_offset": 88,
+            "bit_length": 12,
+            "data_type": "uint",
+            "scale_multiplier": 1.0,
+            "offset_bias": 0.0,
+            "unit": "raw_counts",
+            "notes": "Multiplier undocumented. Requires manual calibration curve analysis."
+        },
+        {
+            "name": "emergency_stop",
+            "bit_offset": 112,
+            "bit_length": 1,
+            "data_type": "bool",
+            "notes": "1 indicates triggered emergency stop."
+        }
+    ]
+}

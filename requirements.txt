@@ -1,0 +1,13 @@
+# Pinned to the versions this project was built and validated against.
+# Python 3.12+ required (built on 3.12.10).
+
+numpy==2.5.3
+pandas==3.0.6
+pyarrow==25.0.1
+duckdb==1.5.5
+streamlit==1.64.0
+plotly==7.1.0
+
+# Cross-check for the ingest memory probe; the probe itself uses the Win32
+# working-set counters and falls back to psutil off Windows.
+psutil==7.2.2

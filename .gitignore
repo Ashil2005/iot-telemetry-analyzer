@@ -1,0 +1,43 @@
+# --- data (never commit: ~96 MB raw, ~38 MB decoded) ---
+RAW-DATA/
+decoded/
+*.raw
+*.bin
+*.parquet
+
+# --- databases (rebuilt from decoded/) ---
+*.duckdb
+*.duckdb.wal
+
+# --- environments ---
+.venv/
+venv/
+env/
+
+# --- python bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- scratch / logs ---
+_tmp*/
+tmp/
+*.log
+*.out
+scratch/
+
+# --- packaging / tooling caches ---
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
