@@ -190,6 +190,144 @@ def estop_frames(con: duckdb.DuckDBPyConnection, source_file: str) -> list[int]:
 
 
 # --------------------------------------------------------------------------
+# Range analysis: the whole corpus as one timeline
+# --------------------------------------------------------------------------
+
+# Every range query filters the FULL flagged view rather than pushing the
+# time predicate underneath the LAG window.  That costs a full-corpus window
+# pass (~380 MB, well inside budget) and is the only way ts_reversal and
+# ts_duplicate stay correct at the edges of an arbitrary window: a packet's
+# predecessor is the one that really preceded it, not the first row that
+# happened to survive the filter.
+
+def corpus_span(con: duckdb.DuckDBPyConnection) -> dict:
+    """Overall extent of the corpus, for defaulting the range controls."""
+    row = con.cursor().execute("""
+        SELECT CAST(min(timestamp_seconds) AS BIGINT) AS t_min,
+               CAST(max(timestamp_seconds) AS BIGINT) AS t_max,
+               CAST(count(*) AS BIGINT)               AS rows,
+               count(DISTINCT source_file)            AS files,
+               count(DISTINCT device_id)              AS devices
+        FROM %s
+    """ % VIEW).fetchone()
+    out = dict(zip(["t_min", "t_max", "rows", "files", "devices"], row))
+    out["span_hours"] = (out["t_max"] - out["t_min"]) / 3600.0
+    return out
+
+
+def range_summary(con: duckdb.DuckDBPyConnection, t0: int, t1: int) -> dict:
+    """Headline metrics for one time window, across every file it touches."""
+    row = con.cursor().execute("""
+        SELECT CAST(count(*) AS BIGINT)                                  AS rows,
+               count(DISTINCT source_file)                               AS files,
+               100.0 * avg(CASE WHEN sync_ok THEN 1 ELSE 0 END)          AS sync_pct,
+               100.0 * avg(CASE WHEN crc_ok  THEN 1 ELSE 0 END)          AS crc_pct,
+               CAST(sum(CASE WHEN bad_sync THEN 1 ELSE 0 END) AS BIGINT) AS bad_sync,
+               CAST(sum(CASE WHEN bad_crc  THEN 1 ELSE 0 END) AS BIGINT) AS bad_crc,
+               CAST(sum(CASE WHEN emergency_stop THEN 1 ELSE 0 END)
+                    AS BIGINT)                                           AS estops,
+               CAST(sum(CASE WHEN vib_spike THEN 1 ELSE 0 END)
+                    AS BIGINT)                                           AS vib_spikes,
+               CAST(sum(CASE WHEN temp_spike THEN 1 ELSE 0 END)
+                    AS BIGINT)                                           AS temp_spikes,
+               CAST(sum(CASE WHEN ts_reversal THEN 1 ELSE 0 END)
+                    AS BIGINT)                                           AS reversals,
+               CAST(sum(CASE WHEN ts_duplicate THEN 1 ELSE 0 END)
+                    AS BIGINT)                                           AS duplicates,
+               round(CAST(avg(vibration) AS DOUBLE), 2)                  AS vib_avg,
+               CAST(max(vibration) AS BIGINT)                            AS vib_max,
+               round(CAST(avg(cylinder_temperature) AS DOUBLE), 2)       AS temp_avg,
+               round(CAST(max(cylinder_temperature) AS DOUBLE), 1)       AS temp_max,
+               round(CAST(avg(motor_rpm) AS DOUBLE), 1)                  AS rpm_avg,
+               round(CAST(max(motor_rpm) AS DOUBLE), 1)                  AS rpm_max,
+               round(CAST(avg(oil_pressure) AS DOUBLE), 2)               AS psi_avg,
+               CAST(max(oil_pressure) AS BIGINT)                         AS psi_max,
+               CAST(min(timestamp_seconds) AS BIGINT)                    AS first_ts,
+               CAST(max(timestamp_seconds) AS BIGINT)                    AS last_ts
+        FROM %s
+        WHERE timestamp_seconds BETWEEN ? AND ?
+    """ % VIEW, [int(t0), int(t1)]).fetchone()
+    names = ["rows", "files", "sync_pct", "crc_pct", "bad_sync", "bad_crc",
+             "estops", "vib_spikes", "temp_spikes", "reversals", "duplicates",
+             "vib_avg", "vib_max", "temp_avg", "temp_max", "rpm_avg", "rpm_max",
+             "psi_avg", "psi_max", "first_ts", "last_ts"]
+    return dict(zip(names, row))
+
+
+def range_files(con: duckdb.DuckDBPyConnection, t0: int, t1: int):
+    """Which files a window touches, and how much of each it takes."""
+    return con.cursor().execute("""
+        SELECT source_file,
+               CAST(count(*) AS BIGINT)               AS rows,
+               CAST(min(timestamp_seconds) AS BIGINT) AS first_ts,
+               CAST(max(timestamp_seconds) AS BIGINT) AS last_ts,
+               CAST(sum(CASE WHEN emergency_stop THEN 1 ELSE 0 END)
+                    AS BIGINT)                        AS estops
+        FROM %s
+        WHERE timestamp_seconds BETWEEN ? AND ?
+        GROUP BY source_file
+        ORDER BY min(timestamp_ms)
+    """ % VIEW, [int(t0), int(t1)]).df()
+
+
+def range_series(con: duckdb.DuckDBPyConnection, t0: int, t1: int,
+                 channels: list[str], buckets: int = DEFAULT_BUCKETS):
+    """Downsample a time window to ~``buckets`` points, ordered by time.
+
+    Buckets run over timestamp_ms rather than frame_index, so a window that
+    spans file boundaries still produces one continuous series.  Each bucket
+    carries avg AND max so spikes survive, plus its own emergency-stop count.
+    """
+    bad = [c for c in channels if c not in SERIES_CHANNELS]
+    if bad:
+        raise ValueError("unknown channel(s): %s" % ", ".join(bad))
+    if not channels:
+        channels = ["vibration"]
+
+    aggregates = ",\n               ".join(
+        "avg(CAST(%s AS DOUBLE)) AS %s_avg, max(CAST(%s AS DOUBLE)) AS %s_max"
+        % (c, c, c, c) for c in channels
+    )
+    sql = """
+        WITH src AS (
+            SELECT timestamp_ms, source_file, emergency_stop, {cols}
+            FROM {view}
+            WHERE timestamp_seconds BETWEEN ? AND ?
+        ), bucketed AS (
+            SELECT NTILE({buckets}) OVER (ORDER BY timestamp_ms) AS bucket, *
+            FROM src
+        )
+        SELECT bucket,
+               CAST(min(timestamp_ms) AS BIGINT)  AS ts_start,
+               CAST(max(timestamp_ms) AS BIGINT)  AS ts_end,
+               CAST(avg(timestamp_ms) AS BIGINT)  AS ts_mid,
+               CAST(count(*) AS BIGINT)           AS frames,
+               count(DISTINCT source_file)        AS files,
+               CAST(sum(CASE WHEN emergency_stop THEN 1 ELSE 0 END)
+                    AS BIGINT)                    AS estops,
+               {aggregates}
+        FROM bucketed
+        GROUP BY bucket
+        ORDER BY bucket
+    """.format(view=VIEW, buckets=int(buckets), cols=", ".join(channels),
+               aggregates=aggregates)
+    return con.cursor().execute(sql, [int(t0), int(t1)]).df()
+
+
+def range_estop_times(con: duckdb.DuckDBPyConnection, t0: int, t1: int,
+                      limit: int = 400) -> list[int]:
+    """timestamp_ms of emergency stops in a window, capped for plotting."""
+    rows = con.cursor().execute("""
+        SELECT CAST(timestamp_ms AS BIGINT)
+        FROM %s
+        WHERE timestamp_seconds BETWEEN ? AND ? AND emergency_stop
+        ORDER BY timestamp_ms
+        LIMIT ?
+    """ % VIEW, [int(t0), int(t1), int(limit)]).fetchall()
+    return [int(r[0]) for r in rows]
+
+
+# --------------------------------------------------------------------------
 # Tab 4: insight
 # --------------------------------------------------------------------------
 

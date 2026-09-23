@@ -35,6 +35,9 @@ def connect(read_only: bool = False, decoded_dir: str = DECODED_DIR,
     """
     con = duckdb.connect(db_path, read_only=read_only)
     con.execute("SET memory_limit='%s'" % MEMORY_LIMIT)
+    # Timestamps are epoch UTC. Without this DuckDB renders them in the
+    # machine's local zone, which silently shifts every displayed time.
+    con.execute("SET TimeZone='UTC'")
     if not read_only:
         refresh_view(con, decoded_dir)
     return con

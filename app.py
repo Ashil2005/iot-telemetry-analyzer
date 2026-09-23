@@ -8,6 +8,7 @@ ingest.py, all SQL in db.py / anomalies.py / queries.py.
 
 from __future__ import annotations
 
+import datetime as dt_mod
 import os
 import time
 
@@ -334,18 +335,22 @@ def cached_frame_count(version, source_file):
     return q.file_frame_count(get_connection(), source_file)
 
 
-def add_channel_panel(fig, df, channel, row, colour, fill, show_legend):
+def add_channel_panel(fig, df, channel, row, colour, fill, show_legend, x=None):
     """One channel: average line with the avg->max band drawn behind it.
 
     The band is what keeps a single-frame spike of 950 visible after a 20:1
     downsample; the average alone flattens it to ~75.
+
+    ``x`` defaults to the per-file frame axis; the range view passes a
+    timestamp axis instead so a window spanning files plots continuously.
     """
-    x = df["frame_mid"]
+    if x is None:
+        x = df["frame_mid"]
     fig.add_trace(
         go.Scatter(x=x, y=df[channel + "_avg"], name="bucket average",
                    legendgroup="avg", showlegend=show_legend,
                    line=dict(color=colour, width=2),
-                   hovertemplate="frame %{x}<br>avg %{y:.2f}<extra></extra>"),
+                   hovertemplate="%{x}<br>avg %{y:.2f}<extra></extra>"),
         row=row, col=1,
     )
     fig.add_trace(
@@ -353,7 +358,7 @@ def add_channel_panel(fig, df, channel, row, colour, fill, show_legend):
                    legendgroup="max", showlegend=show_legend,
                    line=dict(color=colour, width=1),
                    opacity=0.5, fill="tonexty", fillcolor=fill,
-                   hovertemplate="frame %{x}<br>max %{y:.2f}<extra></extra>"),
+                   hovertemplate="%{x}<br>max %{y:.2f}<extra></extra>"),
         row=row, col=1,
     )
 
@@ -446,6 +451,276 @@ def render_time_series() -> None:
 
 
 # --------------------------------------------------------------------------
+# Range analysis: the whole corpus as one timeline
+# --------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def cached_span(version):
+    return q.corpus_span(get_connection())
+
+
+@st.cache_data(show_spinner=False)
+def cached_range_summary(version, t0, t1):
+    return q.range_summary(get_connection(), t0, t1)
+
+
+@st.cache_data(show_spinner=False)
+def cached_range_files(version, t0, t1):
+    return q.range_files(get_connection(), t0, t1)
+
+
+@st.cache_data(show_spinner=False)
+def cached_range_series(version, t0, t1, channels, buckets):
+    return q.range_series(get_connection(), t0, t1, list(channels), buckets)
+
+
+@st.cache_data(show_spinner=False)
+def cached_range_estops(version, t0, t1, limit):
+    return q.range_estop_times(get_connection(), t0, t1, limit)
+
+
+def to_utc(epoch: int) -> dt_mod.datetime:
+    return dt_mod.datetime.fromtimestamp(int(epoch), dt_mod.timezone.utc)
+
+
+def from_parts(day: dt_mod.date, clock: dt_mod.time) -> int:
+    """Combine a date and a time as UTC and return epoch seconds."""
+    return int(dt_mod.datetime.combine(day, clock,
+                                       tzinfo=dt_mod.timezone.utc).timestamp())
+
+
+def humanise(seconds: int) -> str:
+    seconds = max(int(seconds), 0)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return "%dd %dh %dm" % (days, hours, minutes)
+    if hours:
+        return "%dh %dm" % (hours, minutes)
+    return "%dm %ds" % (minutes, secs)
+
+
+# Vertical rules stop being readable past this many events; beyond it the
+# per-bucket count panel carries the information instead.
+VLINE_BUDGET = 200
+
+
+def render_range_analysis() -> None:
+    st.subheader("Date / time range across the whole corpus")
+
+    version = q.data_version()
+    span = cached_span(version)
+    t_min, t_max = int(span["t_min"]), int(span["t_max"])
+
+    st.caption(
+        "All %d files are loaded as one continuous timeline: %s packets from "
+        "%d device(s), %s UTC to %s UTC (%.1f hours, no gaps). A range below "
+        "is analysed across file boundaries."
+        % (span["files"], fmt_int(span["rows"]), span["devices"],
+           to_utc(t_min).strftime("%Y-%m-%d %H:%M:%S"),
+           to_utc(t_max).strftime("%Y-%m-%d %H:%M:%S"), span["span_hours"])
+    )
+
+    presets = {
+        "Full span (default)": (t_min, t_max),
+        "First 6 hours": (t_min, min(t_min + 6 * 3600, t_max)),
+        "Last 6 hours": (max(t_max - 6 * 3600, t_min), t_max),
+        "First 24 hours": (t_min, min(t_min + 24 * 3600, t_max)),
+        "Custom": None,
+    }
+    def apply_window(a: int, b: int) -> None:
+        """Push a window into the four date/time widgets.
+
+        Written before the widgets are instantiated this run, which is the
+        only point at which a keyed widget will accept a new value - setting
+        it afterwards is ignored and the preset appears to do nothing.
+        """
+        lo_, hi_ = to_utc(a), to_utc(b)
+        st.session_state["range_d0"] = lo_.date()
+        st.session_state["range_t0"] = lo_.time()
+        st.session_state["range_d1"] = hi_.date()
+        st.session_state["range_t1"] = hi_.time()
+
+    if "range_d0" not in st.session_state:
+        apply_window(t_min, t_max)
+
+    previous = st.session_state.get("_range_preset_prev", "Full span (default)")
+    choice = st.selectbox("Preset", list(presets), index=0, key="range_preset")
+    if choice != previous:
+        st.session_state["_range_preset_prev"] = choice
+        if presets[choice] is not None:
+            apply_window(*presets[choice])
+
+    c1, c2, c3, c4 = st.columns(4)
+    start_day = c1.date_input("Start date (UTC)", key="range_d0",
+                              min_value=to_utc(t_min).date(),
+                              max_value=to_utc(t_max).date())
+    start_clock = c2.time_input("Start time (UTC)", key="range_t0", step=1)
+    end_day = c3.date_input("End date (UTC)", key="range_d1",
+                            min_value=to_utc(t_min).date(),
+                            max_value=to_utc(t_max).date())
+    end_clock = c4.time_input("End time (UTC)", key="range_t1", step=1)
+
+    t0 = from_parts(start_day, start_clock)
+    t1 = from_parts(end_day, end_clock)
+
+    if t0 >= t1:
+        st.error("The start of the window must be earlier than its end.")
+        return
+
+    clipped = max(t0, t_min), min(t1, t_max)
+    if (t0, t1) != clipped:
+        st.info("Window clipped to the corpus extent.")
+        t0, t1 = clipped
+
+    summary = cached_range_summary(version, t0, t1)
+    if not summary["rows"]:
+        st.warning("No packets fall inside this window.")
+        return
+
+    st.markdown(
+        "**Selected window:** %s -> %s UTC  |  duration **%s**"
+        % (to_utc(t0).strftime("%Y-%m-%d %H:%M:%S"),
+           to_utc(t1).strftime("%Y-%m-%d %H:%M:%S"), humanise(t1 - t0))
+    )
+
+    # ---- headline tiles for the slice --------------------------------
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Packets in window", fmt_int(summary["rows"]),
+              delta="%.1f%% of corpus" % (100.0 * summary["rows"] / span["rows"]),
+              delta_color="off")
+    m2.metric("Files spanned", fmt_int(summary["files"]),
+              delta="of %d" % span["files"], delta_color="off")
+    m3.metric("Sync pass", "%.4f%%" % summary["sync_pct"],
+              delta="-%s bad" % fmt_int(summary["bad_sync"]),
+              delta_color="inverse")
+    m4.metric("CRC pass", "%.4f%%" % summary["crc_pct"],
+              delta=("-%s bad" % fmt_int(summary["bad_crc"])
+                     if summary["bad_crc"] else "all verify"),
+              delta_color="inverse" if summary["bad_crc"] else "off")
+    m5.metric("Emergency stops", fmt_int(summary["estops"]))
+    m6.metric("Vibration spikes", fmt_int(summary["vib_spikes"]))
+
+    d1_, d2_, d3_, d4_ = st.columns(4)
+    d1_.metric("Timestamp reversals", fmt_int(summary["reversals"]))
+    d2_.metric("Timestamp duplicates", fmt_int(summary["duplicates"]))
+    d3_.metric("Temperature spikes", fmt_int(summary["temp_spikes"]))
+    d4_.metric("Actual data span",
+               humanise(summary["last_ts"] - summary["first_ts"]))
+
+    st.caption(
+        "Filtered over the full telemetry_flagged view, so ts_reversal and "
+        "ts_duplicate still compare each packet with the one that genuinely "
+        "preceded it - including across a file boundary inside the window."
+    )
+
+    ch1, ch2 = st.columns(2)
+    ch1.metric("Vibration avg / max", "%.2f / %s"
+               % (summary["vib_avg"], fmt_int(summary["vib_max"])))
+    ch2.metric("Cyl temp avg / max", "%.2f / %.1f"
+               % (summary["temp_avg"], summary["temp_max"]))
+    ch3, ch4 = st.columns(2)
+    ch3.metric("Motor rpm avg / max", "%.1f / %.1f"
+               % (summary["rpm_avg"], summary["rpm_max"]))
+    ch4.metric("Oil pressure avg / max", "%.2f / %s"
+               % (summary["psi_avg"], fmt_int(summary["psi_max"])))
+
+    # ---- which files the window touches ------------------------------
+    files_df = cached_range_files(version, t0, t1)
+    with st.expander("Files this window spans (%d)" % len(files_df),
+                     expanded=len(files_df) <= 12):
+        shown = files_df.copy()
+        shown["from_utc"] = [to_utc(v).strftime("%Y-%m-%d %H:%M:%S")
+                             for v in shown["first_ts"]]
+        shown["to_utc"] = [to_utc(v).strftime("%Y-%m-%d %H:%M:%S")
+                           for v in shown["last_ts"]]
+        st.dataframe(
+            shown[["source_file", "rows", "from_utc", "to_utc", "estops"]],
+            width="stretch", hide_index=True,
+            column_config={
+                "source_file": st.column_config.TextColumn("file"),
+                "rows": st.column_config.NumberColumn("packets", format="%d"),
+                "from_utc": st.column_config.TextColumn("from (UTC)"),
+                "to_utc": st.column_config.TextColumn("to (UTC)"),
+                "estops": st.column_config.NumberColumn("e-stops", format="%d"),
+            },
+        )
+        partial = files_df[files_df["rows"] < 40000]
+        if len(partial):
+            st.caption(
+                "%d file(s) are only partially inside the window "
+                "(%s) - the range cuts into files, not just between them."
+                % (len(partial), ", ".join(
+                    "%s: %s rows" % (r.source_file, fmt_int(r.rows))
+                    for r in partial.itertuples())[:400])
+            )
+
+    st.divider()
+
+    # ---- downsampled chart over the window ---------------------------
+    s1, s2 = st.columns([3, 1])
+    channels = s1.multiselect("Channels", list(q.SERIES_CHANNELS),
+                              default=list(q.SERIES_CHANNELS),
+                              key="range_channels")
+    buckets = s2.number_input("Buckets", min_value=200, max_value=5000,
+                              value=q.DEFAULT_BUCKETS, step=100,
+                              key="range_buckets")
+    if not channels:
+        st.info("Select at least one channel.")
+        return
+
+    series = cached_range_series(version, t0, t1, tuple(channels), int(buckets))
+    ratio = summary["rows"] / max(len(series), 1)
+    x = pd.to_datetime(series["ts_mid"], unit="ms", utc=True)
+
+    st.caption(
+        "%s packets bucketed to %s points in DuckDB (%.0f:1), ordered by "
+        "timestamp rather than frame index so the series stays continuous "
+        "across the %d file(s). Each bucket carries its peak, so single-frame "
+        "spikes survive."
+        % (fmt_int(summary["rows"]), fmt_int(len(series)), ratio,
+           summary["files"])
+    )
+
+    n_rows = len(channels) + 1
+    fig = make_subplots(
+        rows=n_rows, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        subplot_titles=[CHANNEL_LABELS.get(c, c) for c in channels]
+                       + ["Emergency stops per bucket"],
+    )
+    for i, channel in enumerate(channels, start=1):
+        add_channel_panel(fig, series, channel, i, SERIES_1, SERIES_1_FILL,
+                          show_legend=(i == 1), x=x)
+
+    fig.add_trace(
+        go.Bar(x=x, y=series["estops"], name="emergency stops",
+               marker=dict(color=STATUS_CRITICAL),
+               hovertemplate="%{x}<br>%{y} e-stop(s)<extra></extra>"),
+        row=n_rows, col=1,
+    )
+
+    estop_times = cached_range_estops(version, t0, t1, VLINE_BUDGET + 1)
+    if 0 < len(estop_times) <= VLINE_BUDGET:
+        mark_estops(fig, [pd.Timestamp(v, unit="ms", tz="UTC")
+                          for v in estop_times], n_rows)
+    elif summary["estops"]:
+        st.caption(
+            "%s emergency stops fall in this window - too many to mark "
+            "individually, so the bottom panel counts them per bucket. Narrow "
+            "the window below %d to see individual markers."
+            % (fmt_int(summary["estops"]), VLINE_BUDGET)
+        )
+
+    style_figure(fig, n_rows, height_per=170)
+    fig.update_xaxes(title_text="timestamp (UTC)", row=n_rows, col=1)
+    st.plotly_chart(fig, width="stretch")
+
+    with st.expander("Downsampled data (what the chart receives)"):
+        st.dataframe(series.head(50), width="stretch", hide_index=True)
+
+
+# --------------------------------------------------------------------------
 # Tab 4: insight
 # --------------------------------------------------------------------------
 
@@ -497,7 +772,7 @@ def add_sigma_trace(fig, df, channel, base, row, colour):
             name=CHANNEL_LABELS.get(channel, channel),
             line=dict(color=colour, width=2),
             customdata=np.asarray(raw),
-            hovertemplate="frame %{x}<br>%{y:.2f} sigma"
+            hovertemplate="%{x}<br>%{y:.2f} sigma"
                           "<br>raw %{customdata:.1f}<extra></extra>",
         ),
         row=row, col=1,
@@ -775,12 +1050,15 @@ def main() -> None:
         )
         st.stop()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Overview", "Schema editor", "Time series", "Insight", "Import"]
+    tab1, tab_range, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Overview", "Range analysis", "Schema editor", "Time series",
+         "Insight", "Import"]
     )
 
     with tab1:
         render_overview()
+    with tab_range:
+        render_range_analysis()
     with tab2:
         render_schema_editor()
     with tab3:
